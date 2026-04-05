@@ -1,0 +1,37 @@
+{
+    "project_info": {
+        "sample_name": "THz_3D_Sample"
+    },
+    "scan_params": {
+        "x_steps": 24,
+        "y_steps": 24,
+        "z_steps": 6,
+        "step_mm": 3.0,
+        "z_step_mm": 25.0,
+        "speed_mm_s": 6.0
+    },
+    "hardware_daq": {
+        "samples_per_pixel": 1000,
+        "sampling_rate_hz": 10000.0,
+        "volt_min": -1.2,
+        "volt_max": 0.2
+    },
+    "hardware_motor": {
+        "pulse_ratio_k": 22.13,
+        "v_start_pulses": 10,
+        "acc_pulses": 5000,
+        "dec_pulses": 5000
+    },
+    "auto_focus": {
+        "search_range_mm": 60,
+        "step_mm": 1,
+        "speed_mm_s": 2.0,
+        "wait_time_s": 0.2
+    },
+    "delays_s": {
+        "layer": 0.5,
+        "line": 0.2,
+        "pixel": 0.08
+    },
+    "top_n": 20
+}
