@@ -1,0 +1,4 @@
+__pycache__/
+server_hardware.log
+*.log          # 可选：忽略所有 .log 文件
+*.pyc          # 可选：忽略 Python 编译文件
