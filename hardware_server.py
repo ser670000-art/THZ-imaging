@@ -4,13 +4,14 @@ import ctypes
 import time
 import nidaqmx
 from nidaqmx.constants import TerminalConfiguration, AcquisitionType
+import numpy as np
 import atexit
 import json
 import os
 import logging
 
 # =====================================================================
-# 📝 模块 0：专业日志配置 (取代 print，方便排查长期实验故障)
+# 📝 模块 0：专业日志配置
 # =====================================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -23,7 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger("HardwareServer")
 
 logger.info("======================================================")
-logger.info("  🚀 1ms 高频轮询驱动服务 - DAQ加速版")
+logger.info("  🚀 边缘计算驱动服务 - 高频飞点加速版")
 logger.info("======================================================")
 
 CONFIG_FILE = "scan_config.json"
@@ -32,7 +33,6 @@ CONFIG_FILE = "scan_config.json"
 # ⚙️ 模块 1：读取 JSON 动态配置
 # =====================================================================
 def get_motor_dynamics():
-    """实时读取 JSON 中的电机动力学参数，避免每次重启服务器"""
     try:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
@@ -116,7 +116,7 @@ def set_absolute_zero():
     except: return False
 
 # =====================================================================
-# ⚙️ 模块 5：闭环运动控制引擎
+# ⚙️ 模块 5：闭环运动控制引擎 (保持不变)
 # =====================================================================
 def _wait_for_motion_complete(axis, axis_name, expected_time):
     timeout_limit = expected_time * 1.5 + 2.0  
@@ -147,41 +147,33 @@ def _setup_axis_speed(axis, speed_pulses):
 def move_mm(axis_name, distance_mm, speed_mm_s, k_ratio):
     global GLOBAL_STOP
     if GLOBAL_STOP or speed_mm_s <= 0: return False
-
     axis = {'X': 0, 'Y': 1, 'Z': 2}.get(axis_name.upper(), 0)
     pulses = int(distance_mm * k_ratio)
-    
     _setup_axis_speed(axis, int(speed_mm_s * k_ratio))
     mt_api.MT_Set_Axis_Position_P_Target_Rel(axis, pulses)
-    
     expected_time = abs(distance_mm) / speed_mm_s
     return _wait_for_motion_complete(axis, axis_name, expected_time)
 
 def move_abs_mm(axis_name, target_mm, speed_mm_s, k_ratio):
     global GLOBAL_STOP
     if GLOBAL_STOP or speed_mm_s <= 0: return False
-
     axis = {'X': 0, 'Y': 1, 'Z': 2}.get(axis_name.upper(), 0)
     target_pulses = int(target_mm * k_ratio)
-    
     p_now = ctypes.c_int32(0)
     mt_api.MT_Get_Axis_P_Now(axis, ctypes.byref(p_now))
     distance_pulses = abs(target_pulses - p_now.value)
-    
     _setup_axis_speed(axis, int(speed_mm_s * k_ratio))
     mt_api.MT_Set_Axis_Position_P_Target_Abs(axis, target_pulses)
-    
     expected_time = (distance_pulses / k_ratio) / speed_mm_s if distance_pulses > 0 else 0
     return _wait_for_motion_complete(axis, axis_name, expected_time)
 
 # =====================================================================
-# 📡 模块 6：数据采集引擎 (DAQ) - [核心重构：资源池化]
+# 📡 模块 6：数据采集引擎 (DAQ) - [引入 NumPy 边缘计算]
 # =====================================================================
 _daq_task = None
 _current_daq_config = {}
 
 def cleanup_daq():
-    """退出程序时安全释放采集卡资源"""
     global _daq_task
     if _daq_task:
         try:
@@ -191,59 +183,95 @@ def cleanup_daq():
 
 atexit.register(cleanup_daq)
 
-def read_thz_raw(samples, rate, v_min, v_max):
-    global GLOBAL_STOP, _daq_task, _current_daq_config
-    if GLOBAL_STOP: 
-        raise Exception("硬件已处于急停状态，拒绝采集")
+def _init_or_update_daq(samples, rate, v_min, v_max):
+    """内部辅助函数：管理 NI Task 句柄，避免重复开关"""
+    global _daq_task, _current_daq_config
+    
+    needs_reinit = (
+        _daq_task is None or 
+        _current_daq_config.get('rate') != rate or 
+        _current_daq_config.get('v_min') != v_min or
+        _current_daq_config.get('v_max') != v_max
+    )
+    
+    if needs_reinit:
+        if _daq_task: _daq_task.close()
+        _daq_task = nidaqmx.Task()
+        _daq_task.ai_channels.add_ai_voltage_chan(
+            "Dev1/ai1", # 如果你的卡是 ai0，记得在这里改！
+            terminal_config=TerminalConfiguration.RSE, 
+            min_val=v_min, 
+            max_val=v_max
+        )
+        _daq_task.timing.cfg_samp_clk_timing(
+            rate=rate, 
+            sample_mode=AcquisitionType.FINITE, 
+            samps_per_chan=samples
+        )
+        _current_daq_config = {'rate': rate, 'v_min': v_min, 'v_max': v_max, 'samples': samples}
+        
+    elif _current_daq_config.get('samples') != samples:
+        _daq_task.timing.cfg_samp_clk_timing(
+            rate=rate, 
+            sample_mode=AcquisitionType.FINITE, 
+            samps_per_chan=samples
+        )
+        _current_daq_config['samples'] = samples
+
+def read_raw(samples, rate, v_min, v_max):
+    """【兼容老接口】：纯粹读回一维数组 (用于对焦或单点测试)"""
+    global GLOBAL_STOP, _daq_task
+    if GLOBAL_STOP: raise Exception("硬件已处于急停状态，拒绝采集")
     
     try:
-        # 如果是第一次运行，或者底层采样率/量程发生了变化，才重新分配硬件资源
-        needs_reinit = (
-            _daq_task is None or 
-            _current_daq_config.get('rate') != rate or 
-            _current_daq_config.get('v_min') != v_min or
-            _current_daq_config.get('v_max') != v_max
-        )
-        
-        if needs_reinit:
-            if _daq_task: _daq_task.close()
-            _daq_task = nidaqmx.Task()
-            _daq_task.ai_channels.add_ai_voltage_chan(
-                "Dev1/ai1", 
-                terminal_config=TerminalConfiguration.RSE, 
-                min_val=v_min, 
-                max_val=v_max
-            )
-            _daq_task.timing.cfg_samp_clk_timing(
-                rate=rate, 
-                sample_mode=AcquisitionType.FINITE, 
-                samps_per_chan=samples
-            )
-            _current_daq_config = {'rate': rate, 'v_min': v_min, 'v_max': v_max, 'samples': samples}
-            
-        # 如果仅仅是读取点数变化，不用重建通道，只要改时钟配置即可
-        elif _current_daq_config.get('samples') != samples:
-            _daq_task.timing.cfg_samp_clk_timing(
-                rate=rate, 
-                sample_mode=AcquisitionType.FINITE, 
-                samps_per_chan=samples
-            )
-            _current_daq_config['samples'] = samples
-
-        # 🚀 极致轮询：只要复用上面建好的通道 start -> read -> stop 即可
+        _init_or_update_daq(samples, rate, v_min, v_max)
         _daq_task.start()
         data = _daq_task.read(number_of_samples_per_channel=samples)
         _daq_task.stop()
-        
         return [float(v) for v in data] 
-        
     except Exception as e:
         logger.error(f"[DAQ 采集故障] {e}")
-        # 若出现锁死，销毁句柄强制下次重置
-        if _daq_task:
-            _daq_task.close()
-            _daq_task = None
+        if _daq_task: _daq_task.close(); _daq_task = None
         return [-999.0] * samples
+
+def read_thz_line_binned(total_samples, rate, v_min, v_max, num_pixels):
+    """
+    🔥 【边缘计算核心】：给飞点扫描专用的降维接口
+    直接在服务器端将海量数据切片并求平均，只通过网络传回极小的像素数组！
+    """
+    global GLOBAL_STOP, _daq_task
+    if GLOBAL_STOP: raise Exception("硬件已处于急停状态，拒绝采集")
+    
+    try:
+        _init_or_update_daq(total_samples, rate, v_min, v_max)
+        
+        # 1. 抓取海量底层数据
+        _daq_task.start()
+        data = _daq_task.read(number_of_samples_per_channel=total_samples, timeout=20.0)
+        _daq_task.stop()
+        
+        # 2. 🚀 在这里运用 NumPy 进行服务器端降维打击！
+        # 例如：传进来 100,000 个点，num_pixels=100
+        data_np = np.array(data)
+        
+        # 计算每个像素能分到多少个采样点
+        samples_per_pixel = total_samples // num_pixels
+        valid_length = num_pixels * samples_per_pixel
+        
+        # 规整并切块
+        data_np = data_np[:valid_length]
+        pixel_blocks = data_np.reshape(num_pixels, samples_per_pixel)
+        
+        # 针对每个块求平均，瞬间将噪声抹平
+        line_pixels = np.mean(pixel_blocks, axis=1)
+        
+        # 3. 只通过网络返回这 100 个极其干净的数字
+        return [float(v) for v in line_pixels]
+        
+    except Exception as e:
+        logger.error(f"[DAQ 边缘计算故障] {e}")
+        if _daq_task: _daq_task.close(); _daq_task = None
+        return [-999.0] * num_pixels
 
 if __name__ == "__main__":
     server = ThreadedXMLRPCServer(("127.0.0.1", 8000), allow_none=True, logRequests=False)
@@ -251,7 +279,11 @@ if __name__ == "__main__":
     server.register_function(move_mm, "move_mm")
     server.register_function(move_abs_mm, "move_abs_mm")
     server.register_function(set_absolute_zero, "set_absolute_zero")
-    server.register_function(read_thz_raw, "read_raw")
+    
+    # 注册两套 DAQ 接口
+    server.register_function(read_raw, "read_raw") 
+    server.register_function(read_thz_line_binned, "read_thz_line_binned") # 飞点极速专用
+    
     server.register_function(emergency_stop, "emergency_stop")
     server.register_function(reset_stop, "reset_stop")
 
