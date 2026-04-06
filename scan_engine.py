@@ -76,10 +76,9 @@ class MoveThread(QThread):
         self.finished_signal.emit()
 
 # ==========================================
-# 🚀 3D 高速连续飞点扫描引擎 (融合计算极速版)
+# 🚀 3D 高速连续飞点扫描引擎 (融合计算极致压缩版)
 # ==========================================
 class ScanThread(QThread):
-    # 完美兼容原 UI 接口：发射单个像素数据
     update_signal = pyqtSignal(int, int, int, object, object, float, float) 
     finished_signal = pyqtSignal()
     status_signal = pyqtSignal(str)
@@ -89,7 +88,6 @@ class ScanThread(QThread):
         super().__init__()
         self.cfg = cfg
         self._is_running = True
-        # 保留 processor 主要是为了兼容寻峰对焦复用，扫描阶段直接用底层算好的结果
         self.processor = THzSignalProcessor() 
         self.target_layers = target_layers
         self.patch_file = patch_file
@@ -118,15 +116,13 @@ class ScanThread(QThread):
         line_length_mm = (sp['x_steps'] - 1) * sp['step_mm']
         time_per_pixel = sp['step_mm'] / speed
         
-        # 根据物理速度，反推 DAQ 卡需要的采样率
         rate_hz = float(daq['samples_per_pixel'] / time_per_pixel)
         total_samples_per_line = int(sp['x_steps'] * daq['samples_per_pixel'])
         
-        # 加速缓冲段 (保证滑过扫描区时是绝对匀速，最短2mm)
+        # 缓冲段计算 (最短2mm)
         overshoot_mm = max(2.0, sp['step_mm'] * 1.5)
         time_to_reach_zero = overshoot_mm / speed
 
-        # 1. 连接下位机控制板
         try:
             hw = xmlrpc.client.ServerProxy("http://127.0.0.1:8000/")
             hw.reset_stop() 
@@ -135,9 +131,21 @@ class ScanThread(QThread):
             self.finished_signal.emit()
             return
             
-        # 2. 初始化数据存储 (HDF5)
+        # ==========================================
+        # 📦 建立压缩版 HDF5 数据库 (完美修复维度崩溃问题)
+        # ==========================================
         try:
-            db = THzDataManager(prj['sample_name'], sp['x_steps'], sp['y_steps'], sp['z_steps'], sp['step_mm'], daq['samples_per_pixel'], existing_file=self.patch_file)
+            # 🚀 极其关键：将 `samples_per_pixel` 强行传 1！
+            # 因为底层服务器只返回均值，不再传回原始高频波形数组
+            db = THzDataManager(
+                prj['sample_name'], 
+                sp['x_steps'], 
+                sp['y_steps'], 
+                sp['z_steps'], 
+                sp['step_mm'], 
+                1,  # <--- 就是这里，彻底解放硬盘！
+                existing_file=self.patch_file
+            )
             self.file_created_signal.emit(db.h5_path) 
         except Exception as e:
             self.status_signal.emit(f"❌ 建立存储文件失败: {e}")
@@ -156,7 +164,6 @@ class ScanThread(QThread):
                 if not self._is_running or network_fault: break
                 self.status_signal.emit(f"🔴 第 {z_idx+1}/{sp['z_steps']} 层扫描中 (🚀 高频连续飞点模式)...")
 
-                # ==== Z 轴换层 ====
                 try:
                     target_z = float(z_idx * sp['z_step_mm'] * Z_AXIS_POLARITY)
                     hw.move_abs_mm('Z', target_z, speed, k)
@@ -166,7 +173,6 @@ class ScanThread(QThread):
                     network_fault = True
                     break
 
-                # ==== 全局 Z 轴贪吃蛇逻辑 (Y轴行进方向判断) ====
                 is_layer_even = (z_idx % 2 == 0)
                 y_list = list(range(sp['y_steps'])) if is_layer_even else list(range(sp['y_steps'] - 1, -1, -1))
 
@@ -174,7 +180,6 @@ class ScanThread(QThread):
                     if not self._is_running or network_fault: break
                     self._pause_event.wait() 
 
-                    # ==== Y 轴换行步进 ====
                     try:
                         target_y = float(-y_idx * sp['step_mm'] * Y_AXIS_POLARITY)
                         hw.move_abs_mm('Y', target_y, speed, k)
@@ -183,9 +188,7 @@ class ScanThread(QThread):
                         network_fault = True
                         break
 
-                    # ==== X 轴极速飞点扫描 (全局贪吃蛇判断) ====
                     is_x_forward = (global_line_counter % 2 == 0)
-                    
                     if is_x_forward:
                         real_start_x = 0.0 - overshoot_mm
                         real_end_x = line_length_mm + overshoot_mm
@@ -194,23 +197,20 @@ class ScanThread(QThread):
                         real_end_x = 0.0 - overshoot_mm
 
                     try:
-                        # 1. 移动到带缓冲的起跑线
+                        # 1. 退到起跑线
                         target_start_x = float(-real_start_x * X_AXIS_POLARITY)
                         hw.move_abs_mm('X', target_start_x, speed, k)
                         time.sleep(float(delays['line'])) 
 
-                        # 2. 🔫 后台发令开枪：电机开始匀速冲刺
+                        # 2. 🔫 狂飙冲刺
                         target_end_x = float(-real_end_x * X_AXIS_POLARITY)
                         motor_thread = threading.Thread(target=hw.move_abs_mm, args=('X', target_end_x, speed, k))
                         motor_thread.start()
 
-                        # 3. ⏱ 掐表拦截：等待电机刚好压过真实的扫描起跑线
+                        # 3. 掐表拦截
                         time.sleep(time_to_reach_zero)
 
-                        # ==========================================
-                        # ⚡ 4. 呼叫底层融合引擎！极速拿回精华数据
-                        # ==========================================
-                        # 返回的 result 是一个列表：[raw_means_list, proc_means_list]
+                        # 4. ⚡ 呼叫底层极速融合引擎
                         result = hw.read_thz_line_fused(
                             total_samples_per_line, 
                             rate_hz, 
@@ -219,7 +219,6 @@ class ScanThread(QThread):
                             sp['x_steps']
                         )
                         
-                        # 5. 等待电机刹车
                         motor_thread.join()
 
                         if len(result[0]) < sp['x_steps'] or result[0][0] == -999.0:
@@ -228,23 +227,22 @@ class ScanThread(QThread):
                         raw_means_line = result[0]
                         proc_means_line = result[1]
 
-                        # 🧠 空间映射：如果是反向扫，必须将数据翻转，保证图像绝对对齐
+                        # 🧠 空间倒序映射 (消除拉链锯齿效应)
                         if not is_x_forward:
                             raw_means_line = raw_means_line[::-1]
                             proc_means_line = proc_means_line[::-1]
 
-                        # 💥 极速填弹：把浓缩精华直接灌入数据库和 UI
+                        # 💥 极速填弹与刷图
                         for x_idx in range(sp['x_steps']):
                             if not self._is_running: break
                             
                             r_m = raw_means_line[x_idx]
                             p_m = proc_means_line[x_idx]
                             
-                            # 存入 HDF5 库
-                            # (抛弃了冗余的高频噪声数组，用 [p_m] 占位防错，极大缩小 H5 文件体积)
+                            # 存入 HDF5 库 ([p_m] 为长度1的数组占位，完美匹配上面挖的坑)
                             db.write_pixel(z_idx, x_idx, y_idx, [p_m], r_m, p_m)
                             
-                            # 发射信号给 UI，界面会如丝般瞬间刷出一整行！
+                            # 发送给 UI 渲染
                             self.update_signal.emit(z_idx, y_idx, x_idx, [p_m], [p_m], r_m, p_m)
 
                     except Exception as e:
@@ -254,7 +252,6 @@ class ScanThread(QThread):
                     
                     global_line_counter += 1
 
-            # ===== 扫描结束复位 =====
             if not network_fault and self._is_running:
                 try:
                     hw.move_abs_mm('X', 0.0, float(sp['speed_mm_s']), float(mot['pulse_ratio_k']))
@@ -275,7 +272,7 @@ class ScanThread(QThread):
             self.finished_signal.emit()
 
 # ==========================================
-# 🤖 重构版：Z 轴自动寻峰对焦雷达 (保持绝对值逻辑不变)
+# 🤖 重构版：Z 轴自动寻峰对焦雷达 (保持双接口独立)
 # ==========================================
 class AutoFocusThread(QThread):
     status_signal = pyqtSignal(str)
@@ -328,7 +325,7 @@ class AutoFocusThread(QThread):
                 hw.move_abs_mm('Z', current_z * Z_AXIS_POLARITY, speed, k)
                 time.sleep(wait_time) 
                 
-                # 寻峰因为是单点测试，继续使用 read_raw 是安全的
+                # ✅ 寻峰因为是单点测试，继续使用 read_raw 无损读取 1000 个点
                 raw = hw.read_raw(int(daq['samples_per_pixel']), float(daq['sampling_rate_hz']), float(daq['volt_min']), float(daq['volt_max']))
                 _, proc_mean, _ = self.processor.process_pixel(raw)
                 
