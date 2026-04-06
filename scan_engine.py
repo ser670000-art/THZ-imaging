@@ -76,10 +76,10 @@ class MoveThread(QThread):
         self.finished_signal.emit()
 
 # ==========================================
-# 🚀 3D 高速连续飞点扫描引擎 (On-the-fly 重构版)
+# 🚀 3D 高速连续飞点扫描引擎 (融合计算极速版)
 # ==========================================
 class ScanThread(QThread):
-    # 完美兼容原 UI 接口：发射单个像素数据 (极速连续发射)
+    # 完美兼容原 UI 接口：发射单个像素数据
     update_signal = pyqtSignal(int, int, int, object, object, float, float) 
     finished_signal = pyqtSignal()
     status_signal = pyqtSignal(str)
@@ -89,6 +89,7 @@ class ScanThread(QThread):
         super().__init__()
         self.cfg = cfg
         self._is_running = True
+        # 保留 processor 主要是为了兼容寻峰对焦复用，扫描阶段直接用底层算好的结果
         self.processor = THzSignalProcessor() 
         self.target_layers = target_layers
         self.patch_file = patch_file
@@ -117,7 +118,7 @@ class ScanThread(QThread):
         line_length_mm = (sp['x_steps'] - 1) * sp['step_mm']
         time_per_pixel = sp['step_mm'] / speed
         
-        # 根据物理速度，反推 DAQ 卡需要的采样率 (完美匹配空间距离)
+        # 根据物理速度，反推 DAQ 卡需要的采样率
         rate_hz = float(daq['samples_per_pixel'] / time_per_pixel)
         total_samples_per_line = int(sp['x_steps'] * daq['samples_per_pixel'])
         
@@ -147,13 +148,13 @@ class ScanThread(QThread):
         error_msg = "" 
         z_range = self.target_layers if self.target_layers is not None else range(sp['z_steps'])
         
-        global_line_counter = 0 # 记录全局走过的行数，用于严格的贪吃蛇逻辑
+        global_line_counter = 0
 
         # 🎯 护航开始
         try:
             for z_idx in z_range:
                 if not self._is_running or network_fault: break
-                self.status_signal.emit(f"🔴 第 {z_idx+1}/{sp['z_steps']} 层扫描中 (🚀 高速连续飞点模式)...")
+                self.status_signal.emit(f"🔴 第 {z_idx+1}/{sp['z_steps']} 层扫描中 (🚀 高频连续飞点模式)...")
 
                 # ==== Z 轴换层 ====
                 try:
@@ -206,41 +207,45 @@ class ScanThread(QThread):
                         # 3. ⏱ 掐表拦截：等待电机刚好压过真实的扫描起跑线
                         time.sleep(time_to_reach_zero)
 
-                        # 4. ⚡ NI 硬件全速抓取整行数据！
-                        # 底层会自动复用 NI Task，按 rate_hz 抓取 total_samples
-                        raw_line_data = hw.read_raw(total_samples_per_line, rate_hz, float(daq['volt_min']), float(daq['volt_max']))
+                        # ==========================================
+                        # ⚡ 4. 呼叫底层融合引擎！极速拿回精华数据
+                        # ==========================================
+                        # 返回的 result 是一个列表：[raw_means_list, proc_means_list]
+                        result = hw.read_thz_line_fused(
+                            total_samples_per_line, 
+                            rate_hz, 
+                            float(daq['volt_min']), 
+                            float(daq['volt_max']), 
+                            sp['x_steps']
+                        )
                         
                         # 5. 等待电机刹车
                         motor_thread.join()
 
-                        if len(raw_line_data) < total_samples_per_line or raw_line_data[0] == -999.0:
-                            raise ValueError("DAQ 采集超时或发生严重卡顿丢包")
+                        if len(result[0]) < sp['x_steps'] or result[0][0] == -999.0:
+                            raise ValueError("底层 DAQ 或融合算法异常，拒绝处理无效数据")
 
-                        # ==========================================
-                        # 🧠 空间映射：解剖数据，喂给 UI 和 数据库
-                        # ==========================================
-                        data_array = np.array(raw_line_data[:total_samples_per_line])
-                        
-                        # 切成 x_steps 份，每份代表一个物理像素内的所有采样点
-                        pixel_blocks = data_array.reshape(sp['x_steps'], int(daq['samples_per_pixel']))
+                        raw_means_line = result[0]
+                        proc_means_line = result[1]
 
-                        # 如果是反向扫，必须将数据翻转，否则图像就变成锯齿状的拉链了
+                        # 🧠 空间映射：如果是反向扫，必须将数据翻转，保证图像绝对对齐
                         if not is_x_forward:
-                            pixel_blocks = pixel_blocks[::-1]
+                            raw_means_line = raw_means_line[::-1]
+                            proc_means_line = proc_means_line[::-1]
 
-                        # 💥 极速填弹：暗度陈仓，瞬间给 UI 刷图
+                        # 💥 极速填弹：把浓缩精华直接灌入数据库和 UI
                         for x_idx in range(sp['x_steps']):
                             if not self._is_running: break
                             
-                            px_raw = pixel_blocks[x_idx]
-                            raw_mean, proc_mean, proc_data = self.processor.process_pixel(px_raw)
+                            r_m = raw_means_line[x_idx]
+                            p_m = proc_means_line[x_idx]
                             
                             # 存入 HDF5 库
-                            db.write_pixel(z_idx, x_idx, y_idx, px_raw, raw_mean, proc_mean)
+                            # (抛弃了冗余的高频噪声数组，用 [p_m] 占位防错，极大缩小 H5 文件体积)
+                            db.write_pixel(z_idx, x_idx, y_idx, [p_m], r_m, p_m)
                             
-                            # 原封不动调用老 UI 的单像素信号
-                            # 因为是在内存里循环极快，UI 看起来就像是一整行“唰”地瞬间绘制出来
-                            self.update_signal.emit(z_idx, y_idx, x_idx, px_raw, proc_data, raw_mean, proc_mean)
+                            # 发射信号给 UI，界面会如丝般瞬间刷出一整行！
+                            self.update_signal.emit(z_idx, y_idx, x_idx, [p_m], [p_m], r_m, p_m)
 
                     except Exception as e:
                         error_msg = f"飞点采集链断裂: {e}" 
@@ -270,7 +275,7 @@ class ScanThread(QThread):
             self.finished_signal.emit()
 
 # ==========================================
-# 🤖 重构版：Z 轴自动寻峰对焦雷达 (保持你刚修好的绝对值逻辑不变)
+# 🤖 重构版：Z 轴自动寻峰对焦雷达 (保持绝对值逻辑不变)
 # ==========================================
 class AutoFocusThread(QThread):
     status_signal = pyqtSignal(str)
@@ -323,6 +328,7 @@ class AutoFocusThread(QThread):
                 hw.move_abs_mm('Z', current_z * Z_AXIS_POLARITY, speed, k)
                 time.sleep(wait_time) 
                 
+                # 寻峰因为是单点测试，继续使用 read_raw 是安全的
                 raw = hw.read_raw(int(daq['samples_per_pixel']), float(daq['sampling_rate_hz']), float(daq['volt_min']), float(daq['volt_max']))
                 _, proc_mean, _ = self.processor.process_pixel(raw)
                 
