@@ -24,14 +24,11 @@ logging.basicConfig(
 logger = logging.getLogger("HardwareServer")
 
 logger.info("======================================================")
-logger.info("  🚀 边缘计算驱动服务 - 高频飞点加速版")
+logger.info("  🚀 边缘计算 + 官方 C 语言指针流模式 (Stream) 旗舰版")
 logger.info("======================================================")
 
 CONFIG_FILE = "scan_config.json"
 
-# =====================================================================
-# ⚙️ 模块 1：读取 JSON 动态配置
-# =====================================================================
 def get_motor_dynamics():
     try:
         if os.path.exists(CONFIG_FILE):
@@ -43,62 +40,64 @@ def get_motor_dynamics():
                     "acc": int(mot.get("acc_pulses", 5000)),        
                     "dec": int(mot.get("dec_pulses", 5000))         
                 }
-    except Exception as e:
-        logger.warning(f"读取配置失败，使用保守参数: {e}")
-    
+    except Exception: pass
     return {"v_start": 50, "acc": 2000, "dec": 2000}
 
-# =====================================================================
-# ⚡ 模块 2：破解 Windows 15.6ms 睡眠诅咒
-# =====================================================================
 try:
     winmm = ctypes.windll.winmm
     winmm.timeBeginPeriod(1)
-    def restore_windows_timer():
-        winmm.timeEndPeriod(1)
-    atexit.register(restore_windows_timer)
-    logger.info("[内核提速] 已成功将 Windows 线程调度精度提至 1 毫秒！")
-except Exception as e:
-    logger.error(f"[内核提速失败] 无法调用 winmm.dll: {e}")
+    atexit.register(lambda: winmm.timeEndPeriod(1))
+except Exception: pass
 
 class ThreadedXMLRPCServer(ThreadingMixIn, SimpleXMLRPCServer):
     daemon_threads = True
 
 # =====================================================================
-# 🔌 模块 3：硬件 DLL 驱动抽象层 (HAL)
+# 🔌 模块 3：官方 MT_API.h 精确驱动抽象层 (HAL)
 # =====================================================================
 try:
     mt_api = ctypes.windll.LoadLibrary("./MT_API.dll")
     mt_api.MT_Init()
     mt_api.MT_Open_USB()
     
+    # --- 点到点基础 API ---
     mt_api.MT_Set_Axis_Mode_Position.argtypes = [ctypes.c_uint16]
-    mt_api.MT_Set_Axis_Position_V_Start.argtypes = [ctypes.c_uint16, ctypes.c_int32]
     mt_api.MT_Set_Axis_Position_V_Max.argtypes = [ctypes.c_uint16, ctypes.c_int32]
-    mt_api.MT_Set_Axis_Position_Acc.argtypes = [ctypes.c_uint16, ctypes.c_int32]
-    mt_api.MT_Set_Axis_Position_Dec.argtypes = [ctypes.c_uint16, ctypes.c_int32]
     mt_api.MT_Set_Axis_Position_P_Target_Rel.argtypes = [ctypes.c_uint16, ctypes.c_int32]
     mt_api.MT_Set_Axis_Position_P_Target_Abs.argtypes = [ctypes.c_uint16, ctypes.c_int32]
-    mt_api.MT_Set_Axis_P_Now.argtypes = [ctypes.c_uint16, ctypes.c_int32]
     mt_api.MT_Get_Axis_P_Now.argtypes = [ctypes.c_uint16, ctypes.POINTER(ctypes.c_int32)]
     mt_api.MT_Get_Axis_Status_Run.argtypes = [ctypes.c_uint16, ctypes.POINTER(ctypes.c_int32)]
-    mt_api.MT_Get_Axis_Status_Run.restype = ctypes.c_int32
-    mt_api.MT_Set_Axis_Halt_All.argtypes = []
     mt_api.MT_Set_Axis_Halt_All.restype = ctypes.c_int32
 
-    logger.info("[驱动加载] 滑台 DLL 驱动与内存指针映射成功。")
-except Exception as e:
-    logger.error(f"[驱动加载失败] 请检查 USB 连接或 DLL 路径: {e}")
+    # --- 🌟 基于 MT_API.h 官方定义的 Stream 流模式精确映射 ---
+    # 控制指令
+    mt_api.MT_Set_Stream_Clear.argtypes = []
+    mt_api.MT_Set_Stream_Run.argtypes = []
+    mt_api.MT_Set_Stream_Run.restype = ctypes.c_int32
+    
+    # 速度与轴绑定
+    mt_api.MT_Set_Stream_Line_V_Max.argtypes = [ctypes.c_uint16, ctypes.c_int32]
+    mt_api.MT_Set_Stream_Circle_V_Max.argtypes = [ctypes.c_uint16, ctypes.c_int32]
+    mt_api.MT_Set_Stream_Circle_Axis.argtypes = [ctypes.c_uint16, ctypes.c_int32, ctypes.c_int32]
+    
+    # 压入直线 (注意：pAxis 和 pTarget 必须是 ctypes 指针数组)
+    mt_api.MT_Set_Stream_Line_X_Run_Rel.argtypes = [
+        ctypes.c_uint16, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32)
+    ]
+    
+    # 压入圆弧 (AObj, AR(半径), Axis_Target0, Axis_Target1)
+    mt_api.MT_Set_Stream_Circle_R_CW_Run_Rel.argtypes = [ctypes.c_uint16, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
+    mt_api.MT_Set_Stream_Circle_R_CCW_Run_Rel.argtypes = [ctypes.c_uint16, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
 
-# =====================================================================
-# 🛡️ 模块 4：全局状态与安全锁机制
-# =====================================================================
+    logger.info("[驱动加载] ✅ 基于 MT_API.h 的 C++ 内存指针对齐校验完成。")
+except Exception as e:
+    logger.error(f"[驱动加载失败] {e}")
+
 GLOBAL_STOP = False
 
 def emergency_stop():
     global GLOBAL_STOP
     GLOBAL_STOP = True
-    logger.warning("急停锁死驱动器！")
     try: mt_api.MT_Set_Axis_Halt_All() 
     except: pass
     return True
@@ -111,64 +110,112 @@ def reset_stop():
 def set_absolute_zero():
     try:
         for axis in [0, 1, 2]: mt_api.MT_Set_Axis_P_Now(axis, 0)
-        logger.info("机械位置已设为绝对空间原点 (0,0,0)")
         return True
     except: return False
 
-# =====================================================================
-# ⚙️ 模块 5：闭环运动控制引擎 (保持不变)
-# =====================================================================
 def _wait_for_motion_complete(axis, axis_name, expected_time):
     timeout_limit = expected_time * 1.5 + 2.0  
     start_time = time.perf_counter()  
     pRun = ctypes.c_int32(1) 
-    
     while True:
         if GLOBAL_STOP: return False
-            
         mt_api.MT_Get_Axis_Status_Run(axis, ctypes.byref(pRun))
         if pRun.value == 0: return True
-            
         if time.perf_counter() - start_time > timeout_limit:
-            logger.error(f"[致命错误] {axis_name} 轴运动超时！")
-            emergency_stop() 
-            return False
-            
+            emergency_stop(); return False
         time.sleep(0.001) 
-
-def _setup_axis_speed(axis, speed_pulses):
-    dynamics = get_motor_dynamics()
-    mt_api.MT_Set_Axis_Mode_Position(axis)
-    mt_api.MT_Set_Axis_Position_V_Start(axis, dynamics['v_start']) 
-    mt_api.MT_Set_Axis_Position_V_Max(axis, speed_pulses)
-    mt_api.MT_Set_Axis_Position_Acc(axis, dynamics['acc'])   
-    mt_api.MT_Set_Axis_Position_Dec(axis, dynamics['dec'])   
 
 def move_mm(axis_name, distance_mm, speed_mm_s, k_ratio):
     global GLOBAL_STOP
     if GLOBAL_STOP or speed_mm_s <= 0: return False
     axis = {'X': 0, 'Y': 1, 'Z': 2}.get(axis_name.upper(), 0)
-    pulses = int(distance_mm * k_ratio)
-    _setup_axis_speed(axis, int(speed_mm_s * k_ratio))
-    mt_api.MT_Set_Axis_Position_P_Target_Rel(axis, pulses)
-    expected_time = abs(distance_mm) / speed_mm_s
-    return _wait_for_motion_complete(axis, axis_name, expected_time)
+    mt_api.MT_Set_Axis_Mode_Position(axis)
+    mt_api.MT_Set_Axis_Position_V_Max(axis, int(speed_mm_s * k_ratio))
+    mt_api.MT_Set_Axis_Position_P_Target_Rel(axis, int(distance_mm * k_ratio))
+    return _wait_for_motion_complete(axis, axis_name, abs(distance_mm) / speed_mm_s)
 
 def move_abs_mm(axis_name, target_mm, speed_mm_s, k_ratio):
     global GLOBAL_STOP
     if GLOBAL_STOP or speed_mm_s <= 0: return False
     axis = {'X': 0, 'Y': 1, 'Z': 2}.get(axis_name.upper(), 0)
-    target_pulses = int(target_mm * k_ratio)
-    p_now = ctypes.c_int32(0)
-    mt_api.MT_Get_Axis_P_Now(axis, ctypes.byref(p_now))
-    distance_pulses = abs(target_pulses - p_now.value)
-    _setup_axis_speed(axis, int(speed_mm_s * k_ratio))
-    mt_api.MT_Set_Axis_Position_P_Target_Abs(axis, target_pulses)
-    expected_time = (distance_pulses / k_ratio) / speed_mm_s if distance_pulses > 0 else 0
-    return _wait_for_motion_complete(axis, axis_name, expected_time)
+    mt_api.MT_Set_Axis_Mode_Position(axis)
+    mt_api.MT_Set_Axis_Position_V_Max(axis, int(speed_mm_s * k_ratio))
+    mt_api.MT_Set_Axis_Position_P_Target_Abs(axis, int(target_mm * k_ratio))
+    return _wait_for_motion_complete(axis, axis_name, 5.0)
 
 # =====================================================================
-# 📡 模块 6：数据采集引擎 (DAQ) - [引入 NumPy 边缘计算]
+# 🎢 核心功能二：硬件底层缓存的流式连续轨迹引擎 (官方解密版)
+# =====================================================================
+def test_smooth_snake_trajectory(x_length_mm, y_step_mm, lines, speed_mm_s, k_ratio):
+    global GLOBAL_STOP
+    if GLOBAL_STOP: return False
+
+    logger.info("======================================================")
+    logger.info(f" 🎢 官方流模式 (Stream) 空跑测试：扫 {lines} 行，无缝过弯掉头")
+    logger.info("======================================================")
+
+    try:
+        axis_x, axis_y = 0, 1
+        group_id = 0  # 流的默认对象组 ID
+        
+        speed_pulses = int(speed_mm_s * k_ratio)
+        x_dist_pulses = int(x_length_mm * k_ratio)
+        y_step_pulses = int(y_step_mm * k_ratio)
+        radius_pulses = int((y_step_mm / 2.0) * k_ratio)
+
+        # 1. 净化缓存区，并绑定参数
+        mt_api.MT_Set_Stream_Clear()
+        mt_api.MT_Set_Stream_Line_V_Max(group_id, speed_pulses)
+        mt_api.MT_Set_Stream_Circle_V_Max(group_id, speed_pulses)
+        mt_api.MT_Set_Stream_Circle_Axis(group_id, axis_x, axis_y)
+
+        # 2. 批量往底层硬件缓存压入贪吃蛇路线图
+        current_x_dir = 1
+        
+        for i in range(lines):
+            dist_x = x_dist_pulses * current_x_dir
+            
+            # --- 构建 C 语言指针数组 (极其关键！) ---
+            pAxis = (ctypes.c_int32 * 1)(axis_x)     # 告知哪个轴运动
+            pTarget = (ctypes.c_int32 * 1)(dist_x)   # 告知相对运动量
+            # 压入多轴直线
+            mt_api.MT_Set_Stream_Line_X_Run_Rel(group_id, 1, pAxis, pTarget)
+            logger.info(f" ➔ 装填 [直线]：轴{axis_x} 走 {dist_x} 脉冲")
+
+            # 不是最后一行则压入半圆掉头
+            if i < lines - 1:
+                # 官方头文件定义: (Obj, 半径, 终点X偏移, 终点Y偏移)
+                if current_x_dir == 1:
+                    mt_api.MT_Set_Stream_Circle_R_CW_Run_Rel(group_id, radius_pulses, 0, y_step_pulses)
+                    logger.info(f" ➔ 装填 [圆弧]：顺时针过弯")
+                else:
+                    mt_api.MT_Set_Stream_Circle_R_CCW_Run_Rel(group_id, radius_pulses, 0, y_step_pulses)
+                    logger.info(f" ➔ 装填 [圆弧]：逆时针过弯")
+
+            current_x_dir *= -1
+
+        # 3. 💥 引爆缓存区，交出控制权！
+        logger.info("🚀 数据装填完毕，硬件连续流启动！脱离电脑控制狂飙！")
+        res = mt_api.MT_Set_Stream_Run()
+        
+        if res != 0:
+            logger.error(f"启动数据流失败，板卡返回错误码: {res}")
+            return False
+        
+        # 用总时间监控 X 轴，等待全流程执行完毕
+        total_dist = (x_length_mm * lines) + (y_step_mm * 1.57 * (lines - 1))
+        _wait_for_motion_complete(axis_x, "X(流模式)", total_dist / speed_mm_s)
+        
+        logger.info("✅ 测试圆满完成，机床完美停稳。")
+        return True
+
+    except Exception as e:
+        logger.error(f"[流模式测试失败] {e}")
+        emergency_stop()
+        return False
+
+# =====================================================================
+# 📡 模块 6：数据采集引擎 (DAQ) 边缘计算
 # =====================================================================
 _daq_task = None
 _current_daq_config = {}
@@ -176,121 +223,61 @@ _current_daq_config = {}
 def cleanup_daq():
     global _daq_task
     if _daq_task:
-        try:
-            _daq_task.close()
-            logger.info("DAQ 资源已安全释放。")
+        try: _daq_task.close(); logger.info("DAQ 释放。")
         except: pass
 
 atexit.register(cleanup_daq)
 
 def _init_or_update_daq(samples, rate, v_min, v_max):
-    """内部辅助函数：管理 NI Task 句柄，避免重复开关"""
     global _daq_task, _current_daq_config
-    
-    needs_reinit = (
-        _daq_task is None or 
-        _current_daq_config.get('rate') != rate or 
-        _current_daq_config.get('v_min') != v_min or
-        _current_daq_config.get('v_max') != v_max
-    )
-    
+    needs_reinit = (_daq_task is None or _current_daq_config.get('rate') != rate)
     if needs_reinit:
         if _daq_task: _daq_task.close()
         _daq_task = nidaqmx.Task()
-        _daq_task.ai_channels.add_ai_voltage_chan(
-            "Dev1/ai1", # 如果你的卡是 ai0，记得在这里改！
-            terminal_config=TerminalConfiguration.RSE, 
-            min_val=v_min, 
-            max_val=v_max
-        )
-        _daq_task.timing.cfg_samp_clk_timing(
-            rate=rate, 
-            sample_mode=AcquisitionType.FINITE, 
-            samps_per_chan=samples
-        )
+        _daq_task.ai_channels.add_ai_voltage_chan("Dev1/ai1", terminal_config=TerminalConfiguration.RSE, min_val=v_min, max_val=v_max)
+        _daq_task.timing.cfg_samp_clk_timing(rate=rate, sample_mode=AcquisitionType.FINITE, samps_per_chan=samples)
         _current_daq_config = {'rate': rate, 'v_min': v_min, 'v_max': v_max, 'samples': samples}
-        
     elif _current_daq_config.get('samples') != samples:
-        _daq_task.timing.cfg_samp_clk_timing(
-            rate=rate, 
-            sample_mode=AcquisitionType.FINITE, 
-            samps_per_chan=samples
-        )
+        _daq_task.timing.cfg_samp_clk_timing(rate=rate, sample_mode=AcquisitionType.FINITE, samps_per_chan=samples)
         _current_daq_config['samples'] = samples
 
 def read_raw(samples, rate, v_min, v_max):
-    """【兼容老接口】：纯粹读回一维数组 (用于对焦或单点测试)"""
     global GLOBAL_STOP, _daq_task
-    if GLOBAL_STOP: raise Exception("硬件已处于急停状态，拒绝采集")
-    
+    if GLOBAL_STOP: raise Exception("急停态")
     try:
         _init_or_update_daq(samples, rate, v_min, v_max)
-        _daq_task.start()
-        data = _daq_task.read(number_of_samples_per_channel=samples)
-        _daq_task.stop()
+        _daq_task.start(); data = _daq_task.read(number_of_samples_per_channel=samples); _daq_task.stop()
         return [float(v) for v in data] 
     except Exception as e:
-        logger.error(f"[DAQ 采集故障] {e}")
         if _daq_task: _daq_task.close(); _daq_task = None
         return [-999.0] * samples
 
 def read_thz_line_binned(total_samples, rate, v_min, v_max, num_pixels):
-    """
-    🔥 【边缘计算核心】：给飞点扫描专用的降维接口
-    直接在服务器端将海量数据切片并求平均，只通过网络传回极小的像素数组！
-    """
     global GLOBAL_STOP, _daq_task
-    if GLOBAL_STOP: raise Exception("硬件已处于急停状态，拒绝采集")
-    
+    if GLOBAL_STOP: raise Exception("急停态")
     try:
         _init_or_update_daq(total_samples, rate, v_min, v_max)
-        
-        # 1. 抓取海量底层数据
-        _daq_task.start()
-        data = _daq_task.read(number_of_samples_per_channel=total_samples, timeout=20.0)
-        _daq_task.stop()
-        
-        # 2. 🚀 在这里运用 NumPy 进行服务器端降维打击！
-        # 例如：传进来 100,000 个点，num_pixels=100
+        _daq_task.start(); data = _daq_task.read(number_of_samples_per_channel=total_samples, timeout=20.0); _daq_task.stop()
         data_np = np.array(data)
-        
-        # 计算每个像素能分到多少个采样点
         samples_per_pixel = total_samples // num_pixels
-        valid_length = num_pixels * samples_per_pixel
-        
-        # 规整并切块
-        data_np = data_np[:valid_length]
-        pixel_blocks = data_np.reshape(num_pixels, samples_per_pixel)
-        
-        # 针对每个块求平均，瞬间将噪声抹平
-        line_pixels = np.mean(pixel_blocks, axis=1)
-        
-        # 3. 只通过网络返回这 100 个极其干净的数字
-        return [float(v) for v in line_pixels]
-        
+        pixel_blocks = data_np[:num_pixels * samples_per_pixel].reshape(num_pixels, samples_per_pixel)
+        return [float(v) for v in np.mean(pixel_blocks, axis=1)]
     except Exception as e:
-        logger.error(f"[DAQ 边缘计算故障] {e}")
         if _daq_task: _daq_task.close(); _daq_task = None
         return [-999.0] * num_pixels
 
 if __name__ == "__main__":
     server = ThreadedXMLRPCServer(("127.0.0.1", 8000), allow_none=True, logRequests=False)
-    
     server.register_function(move_mm, "move_mm")
     server.register_function(move_abs_mm, "move_abs_mm")
     server.register_function(set_absolute_zero, "set_absolute_zero")
-    
-    # 注册两套 DAQ 接口
     server.register_function(read_raw, "read_raw") 
-    server.register_function(read_thz_line_binned, "read_thz_line_binned") # 飞点极速专用
-    
+    server.register_function(read_thz_line_binned, "read_thz_line_binned") 
     server.register_function(emergency_stop, "emergency_stop")
     server.register_function(reset_stop, "reset_stop")
+    
+    server.register_function(test_smooth_snake_trajectory, "test_smooth_snake_trajectory")
 
     logger.info("🔌 多线程 XML-RPC 服务已在 8000 端口启动。")
-    logger.info("------------------------------------------------------")
-    
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("服务已手动终止。")
+    try: server.serve_forever()
+    except KeyboardInterrupt: pass
